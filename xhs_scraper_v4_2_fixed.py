@@ -48,50 +48,10 @@ MAX_SCROLL_ROUNDS = 30
 
 # Gemini 免费 API（每日 1500 次，无需信用卡）
 GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1/models/"  # 改用 v1
+    "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-1.5-flash:generateContent?key={api_key}"
 )
 
-def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
-    """改进的 Gemini 调用"""
-    url = GEMINI_API_URL.format(api_key=api_key)
-    
-    try:
-        # 直接调用，无需预验证（减少一次 API 请求，节省配额）
-        resp = requests.post(url, json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
-        }, timeout=60)
-        
-        # 详细的错误处理
-        if resp.status_code == 404:
-            return ("⚠️ Gemini API 端点 404\n"
-                   "可能原因：\n"
-                   "  1. API Key 无效或已失效 → 重新申请：https://aistudio.google.com/app/apikey\n"
-                   "  2. 模型不可用（gemini-1.5-flash 可能已变更）→ 检查 API 文档\n"
-                   "  3. 地区限制 → 某些国家可能不支持")
-        
-        if resp.status_code == 401:
-            return "⚠️ Gemini API 认证失败（401）→ 请检查 API Key 是否正确"
-        
-        if resp.status_code == 429:
-            return "⚠️ Gemini API 配额已满（1500次/天）→ 请明天再试"
-        
-        if resp.status_code == 400:
-            error_detail = resp.json().get("error", {}).get("message", "未知错误")
-            return f"⚠️ 请求参数错误（400）：{error_detail}"
-        
-        resp.raise_for_status()  # 其他错误则抛出异常
-        
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-        
-    except requests.exceptions.JSONDecodeError as e:
-        return f"⚠️ API 返回非法 JSON：{resp.text[:200]}"
-    except requests.exceptions.Timeout:
-        return "⚠️ 请求超时（60秒）→ 网络可能较慢或服务繁忙"
-    except Exception as e:
-        return f"⚠️ Gemini 请求异常：{type(e).__name__}: {str(e)[:100]}"
 # ---- 移动端 UA：让小红书走手机渲染路径，绕过"扫码才能看"限制 ----
 MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -678,21 +638,7 @@ def ensure_login(driver) -> bool:
             return manual_login(driver)
         return False
 
-def search_keyword(driver, keyword: str):
-    """Navigate to search results page and wait for it to load"""
-    url = XHS_SEARCH_URL.format(kw=keyword)
-    print(f"\n搜索：{keyword}")
-    driver.get(url)
-    random_sleep(3, 5)
-    
-    # Wait for search results to load
-    try:
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_all_elements_located((By.XPATH, SEL["note_items"][0]))
-        )
-        print(f"  搜索结果已加载")
-    except TimeoutException:
-        print(f"  搜索结果加载超时（可能结果为空）")
+
 # =========================================================
 # 搜索
 # =========================================================
@@ -730,20 +676,66 @@ def _sniff_note_selector(driver) -> str | None:
     return None
 
 
-def search_keyword_via_api(driver, keyword: str):
-    """通过小红书内部 API 获取搜索结果，直接突破"仅在App中查看"限制。"""
-    print(f"\n搜索：{keyword}（API 模式）")
-    
-    # 正确的 API 端点
-    api_url = "https://edith.xiaohongshu.com/api/sns/web/v1/search/notes"
-    
-    payload = {
-        "keyword": keyword,
-        "page": page,
-        "page_size": 30,
-        "search_id": hashlib.md5(keyword.encode()).hexdigest(),
-        # ... 其他参数
-    }
+def search_keyword(driver, keyword):
+    """
+    搜索关键词并等待结果加载。
+    修复：加载成功后立即嗅探实际 DOM 结构，把命中的 XPath
+    动态追加到 SEL["note_items"] 最前面，保证后续采集能用上。
+    """
+    print(f"\n搜索：{keyword}")
+    driver.get(XHS_SEARCH_URL.format(kw=keyword))
+    random_sleep(3, 6)
+
+    print(f"  页面标题：{driver.title}")
+
+    # ① 先用预设选择器尝试
+    loaded_xp = None
+    for xp in SEL["note_items"]:
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, xp))
+            )
+            loaded_xp = xp
+            print(f"  预设选择器命中：{xp[:60]}")
+            break
+        except TimeoutException:
+            continue
+
+    # ② 预设全部超时 → 实时嗅探
+    if not loaded_xp:
+        print("  预设选择器全部超时，启动实时 DOM 嗅探...")
+        random_sleep(2, 4)   # 再等一会，让 JS 渲染完成
+        loaded_xp = _sniff_note_selector(driver)
+        if loaded_xp and loaded_xp not in SEL["note_items"]:
+            SEL["note_items"].insert(0, loaded_xp)   # 动态写入，后续采集直接用
+
+    # ③ 还是没找到 → 打印源码片段 + 尝试搜索框
+    if not loaded_xp:
+        print("  嗅探也未命中，打印页面源码片段供调试：")
+        try:
+            src = driver.page_source
+            # 找 class 属性里含 note/card/feed 的标签，帮助定位正确选择器
+            import re as _re
+            hits = _re.findall(r'class="([^"]*(?:note|card|feed|search)[^"]*)"', src)
+            unique = list(dict.fromkeys(hits))[:15]
+            print(f"  含关键字的 class 值（前15个）：{unique}")
+        except Exception:
+            pass
+        # 尝试搜索框
+        box, _ = find_el(driver, SEL["search_input"])
+        if box:
+            print("  改用搜索框重试...")
+            box.click(); random_sleep(0.3, 0.6); box.clear()
+            for ch in keyword:
+                box.send_keys(ch); time.sleep(random.uniform(0.05, 0.15))
+            box.send_keys(Keys.RETURN)
+            random_sleep(3, 5)
+            # 搜索框提交后再嗅探一次
+            sniffed = _sniff_note_selector(driver)
+            if sniffed and sniffed not in SEL["note_items"]:
+                SEL["note_items"].insert(0, sniffed)
+        else:
+            print("  搜索框也未找到，请检查登录状态或网络")
 
 
 # =========================================================

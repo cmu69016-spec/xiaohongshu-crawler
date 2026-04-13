@@ -45,10 +45,11 @@ LOGIN_TIMEOUT     = 120
 TARGET_POSTS      = 100
 MAX_COMMENTS      = 10
 MAX_SCROLL_ROUNDS = 30
+MAX_RETRIES       = 3   # 单个笔记详情页的最大重试次数
 
 # Gemini 免费 API（每日 1500 次，无需信用卡）
 GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "https://generativelanguage.googleapis.com/v1/models/"
     "gemini-1.5-flash:generateContent?key={api_key}"
 )
 
@@ -840,6 +841,9 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
       手机浏览器 UA 则走移动端 H5 路径，内容直接输出到页面 HTML 中。
       配合 CDP Emulation.setDeviceMetricsOverride 同步模拟屏幕参数，
       确保 JS 端 viewport 检测也认为是手机，双重保证内容加载。
+
+    即使使用移动端 UA，部分笔记仍被小红书限制为"仅在 App 中查看"，
+    此时会记录日志并跳过，不占用重试次数。
     """
     link = post.get("link", "")
     if not link:
@@ -847,86 +851,117 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
 
     print(f"    详情页：{post['title'][:28]}...")
     original_url = driver.current_url
-    try:
-        # 进详情页前切换为移动端模式，让小红书渲染完整正文
-        set_mobile_mode(driver, enable=True)
-        driver.get(link)
-        random_sleep(3, 5)
 
-        # 等待正文区域出现（最多 10 秒）
-        body_text = ""
-        for xp in SEL["note_body"]:
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, xp))
-                )
-                parts = driver.find_elements(By.XPATH, xp)
-                body_text = " ".join(p.text.strip() for p in parts if p.text.strip())
-                if body_text:
-                    print(f"      正文抓取成功（{len(body_text)} 字）")
-                    break
-            except TimeoutException:
-                continue
+    # "仅App可见"的页面特征关键词
+    APP_ONLY_SIGNALS = [
+        "仅在App中查看",
+        "在App中打开",
+        "请在App中查看",
+        "open in app",
+        "打开小红书App",
+    ]
 
-        if not body_text:
-            print("      正文未找到（可能仍需登录或 DOM 结构已更新）")
-
-        # 滚动加载评论
-        for _ in range(3):
-            driver.execute_script("window.scrollBy(0, 600);")
-            random_sleep(1.5, 3.0)
-
-        comment_els = find_els(driver, SEL["comment_items"])
-        comments = []
-        for el in comment_els:
-            try:
-                text_el,   _ = find_el(el, SEL["comment_text"])
-                text = text_el.text.strip() if text_el else ""
-                if not text:
-                    continue
-                like_el,   _ = find_el(el, SEL["comment_like"])
-                author_el, _ = find_el(el, SEL["comment_author"])
-                like_raw = like_el.text.strip() if like_el else "0"
-                author   = author_el.text.strip() if author_el else "匿名"
-                comments.append({
-                    "post_uid": post["uid"], "post_title": post["title"],
-                    "comment_text": text,
-                    "comment_like": parse_number(like_raw),
-                    "comment_like_raw": like_raw,
-                    "author": author,
-                })
-            except Exception:
-                continue
-
-        comments.sort(key=lambda x: x["comment_like"], reverse=True)
-        top = comments[:max_comments]
-        print(f"      评论：找到 {len(comment_els)} 条，取 Top {len(top)}")
-        return body_text, top
-
-    except Exception as e:
-        print(f"      详情页异常：{e}")
-        return "", []
-    finally:
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # 返回搜索列表页前恢复 PC 模式，保证选择器正常
-            set_mobile_mode(driver, enable=False)
-            driver.get(original_url)
-            random_sleep(2, 4)
-        except Exception:
-            pass
+            # 进详情页前切换为移动端模式，让小红书渲染完整正文
+            set_mobile_mode(driver, enable=True)
+            driver.get(link)
+            random_sleep(3, 5)
+
+            # ── 检测"仅App可见"限制 ──────────────────────────────
+            page_src = driver.page_source or ""
+            if any(sig in page_src for sig in APP_ONLY_SIGNALS):
+                print(f"      ⚠️ 仅App可见，跳过该笔记（URL：{link}）")
+                return "", []
+
+            # 等待正文区域出现（最多 10 秒）
+            body_text = ""
+            for xp in SEL["note_body"]:
+                try:
+                    WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.XPATH, xp))
+                    )
+                    parts = driver.find_elements(By.XPATH, xp)
+                    body_text = " ".join(p.text.strip() for p in parts if p.text.strip())
+                    if body_text:
+                        print(f"      正文抓取成功（{len(body_text)} 字）")
+                        break
+                except TimeoutException:
+                    continue
+
+            if not body_text:
+                print("      正文未找到（可能仍需登录或 DOM 结构已更新）")
+
+            # 滚动加载评论
+            for _ in range(3):
+                driver.execute_script("window.scrollBy(0, 600);")
+                random_sleep(1.5, 3.0)
+
+            comment_els = find_els(driver, SEL["comment_items"])
+            comments = []
+            for el in comment_els:
+                try:
+                    text_el,   _ = find_el(el, SEL["comment_text"])
+                    text = text_el.text.strip() if text_el else ""
+                    if not text:
+                        continue
+                    like_el,   _ = find_el(el, SEL["comment_like"])
+                    author_el, _ = find_el(el, SEL["comment_author"])
+                    like_raw = like_el.text.strip() if like_el else "0"
+                    author   = author_el.text.strip() if author_el else "匿名"
+                    comments.append({
+                        "post_uid": post["uid"], "post_title": post["title"],
+                        "comment_text": text,
+                        "comment_like": parse_number(like_raw),
+                        "comment_like_raw": like_raw,
+                        "author": author,
+                    })
+                except Exception:
+                    continue
+
+            comments.sort(key=lambda x: x["comment_like"], reverse=True)
+            top = comments[:max_comments]
+            print(f"      评论：找到 {len(comment_els)} 条，取 Top {len(top)}")
+            return body_text, top
+
+        except Exception as e:
+            print(f"      详情页异常（第 {attempt}/{MAX_RETRIES} 次）：{e}")
+            if attempt < MAX_RETRIES:
+                wait = 2 ** attempt  # 指数退避：2, 4, 8 秒
+                print(f"      {wait} 秒后重试...")
+                time.sleep(wait)
+            else:
+                print(f"      已达最大重试次数，跳过该笔记")
+                return "", []
+        finally:
+            try:
+                # 返回搜索列表页前恢复 PC 模式，保证选择器正常
+                set_mobile_mode(driver, enable=False)
+                driver.get(original_url)
+                random_sleep(2, 4)
+            except Exception:
+                pass
+
+    return "", []
 
 
 def scrape_all_details(driver, top10_posts):
     """对 Top10 笔记逐一抓正文+评论"""
     print(f"\n抓取 Top10 笔记详情...")
     all_comments = []
+    app_only_count = 0
     for i, post in enumerate(top10_posts, 1):
         print(f"  [{i}/10] {post['title'][:30]}")
         body, cmts = scrape_detail(driver, post)
         post["body"] = body          # 正文写回 post 字典
+        if not body and not cmts:
+            # scrape_detail 对仅App可见笔记返回 ("", [])，此处计数
+            app_only_count += 1
         all_comments.extend(cmts)
         random_sleep(3, 7)
     print(f"  详情抓取完成，共 {len(all_comments)} 条评论")
+    if app_only_count:
+        print(f"  ⚠️ 有 {app_only_count} 篇笔记因「仅App可见」或异常未能获取正文/评论")
     return all_comments
 
 
@@ -949,9 +984,28 @@ def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
     except requests.exceptions.HTTPError as e:
-        if resp.status_code == 429:
+        code = resp.status_code
+        if code == 404:
+            return (
+                "⚠️ Gemini API 404：模型或端点不存在。\n"
+                "请确认：\n"
+                "  1. API Key 正确且已在 Google AI Studio 启用\n"
+                "  2. 模型名称正确（当前：gemini-1.5-flash）\n"
+                f"  响应详情：{resp.text[:300]}"
+            )
+        if code == 401:
+            return (
+                "⚠️ Gemini API 401：API Key 无效或未授权。\n"
+                "请到 https://aistudio.google.com/app/apikey 检查并重新生成 Key。"
+            )
+        if code == 429:
             return "⚠️ Gemini API 今日免费额度已用完（1500次/天），请明天再试"
-        return f"⚠️ API 请求失败：{e}"
+        if code == 400:
+            return (
+                f"⚠️ Gemini API 400：请求格式错误。\n"
+                f"  响应详情：{resp.text[:300]}"
+            )
+        return f"⚠️ API 请求失败（HTTP {code}）：{e}\n  响应详情：{resp.text[:300]}"
     except Exception as e:
         return f"⚠️ 解析响应失败：{e}"
 

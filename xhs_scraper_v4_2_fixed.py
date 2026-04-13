@@ -60,6 +60,15 @@ MOBILE_UA = (
     "Version/17.0 Mobile/15E148 Safari/604.1"
 )
 
+# ---- 小红书"仅App可见"页面特征关键词 ----
+APP_ONLY_SIGNALS = [
+    "仅在App中查看",
+    "在App中打开",
+    "请在App中查看",
+    "open in app",
+    "打开小红书App",
+]
+
 # ---- XPath 选择器 ----
 SEL = {
     "search_input": [
@@ -852,15 +861,6 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
     print(f"    详情页：{post['title'][:28]}...")
     original_url = driver.current_url
 
-    # "仅App可见"的页面特征关键词
-    APP_ONLY_SIGNALS = [
-        "仅在App中查看",
-        "在App中打开",
-        "请在App中查看",
-        "open in app",
-        "打开小红书App",
-    ]
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             # 进详情页前切换为移动端模式，让小红书渲染完整正文
@@ -941,8 +941,6 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
                 random_sleep(2, 4)
             except Exception:
                 pass
-
-    return "", []
 
 
 def scrape_all_details(driver, top10_posts):

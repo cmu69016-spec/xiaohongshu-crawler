@@ -678,7 +678,21 @@ def ensure_login(driver) -> bool:
             return manual_login(driver)
         return False
 
-
+def search_keyword(driver, keyword: str):
+    """Navigate to search results page and wait for it to load"""
+    url = XHS_SEARCH_URL.format(kw=keyword)
+    print(f"\n搜索：{keyword}")
+    driver.get(url)
+    random_sleep(3, 5)
+    
+    # Wait for search results to load
+    try:
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_all_elements_located((By.XPATH, SEL["note_items"][0]))
+        )
+        print(f"  搜索结果已加载")
+    except TimeoutException:
+        print(f"  搜索结果加载超时（可能结果为空）")
 # =========================================================
 # 搜索
 # =========================================================

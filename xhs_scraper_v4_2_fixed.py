@@ -48,7 +48,7 @@ MAX_SCROLL_ROUNDS = 30
 
 # Gemini 免费 API（每日 1500 次，无需信用卡）
 GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "https://generativelanguage.googleapis.com/v1/models/"
     "gemini-1.5-flash:generateContent?key={api_key}"
 )
 
@@ -915,6 +915,91 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
         except Exception:
             pass
 
+def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
+    """
+    进入笔记详情页，抓取正文+评论
+    新增：检测"仅在App中查看"限制
+    """
+    link = post.get("link", "")
+    if not link:
+        return "", []
+
+    print(f"    详情页：{post['title'][:28]}...")
+    original_url = driver.current_url
+    try:
+        set_mobile_mode(driver, enable=True)
+        driver.get(link)
+        random_sleep(3, 5)
+
+        # ✅ 检测"仅在App中查看"标志
+        page_text = driver.page_source
+        app_only_keywords = ["仅在app中查看", "only in app", "app查看", "应用中查看"]
+        is_app_only = any(kw in page_text.lower() for kw in app_only_keywords)
+        
+        if is_app_only:
+            print(f"      ⚠️  该笔记被限制仅在App中查看（无法突破）")
+            return "【该笔记仅在小红书App中可见，网页版已被限制】", []
+
+        # 继续尝试抓取正文...
+        body_text = ""
+        for xp in SEL["note_body"]:
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, xp))
+                )
+                parts = driver.find_elements(By.XPATH, xp)
+                body_text = " ".join(p.text.strip() for p in parts if p.text.strip())
+                if body_text:
+                    print(f"      正文抓取成功（{len(body_text)} 字）")
+                    break
+            except TimeoutException:
+                continue
+
+        if not body_text:
+            print("      正文未找到（可能仍需登录或 DOM 结构已更新）")
+
+        # 滚动加载评论...
+        for _ in range(3):
+            driver.execute_script("window.scrollBy(0, 600);")
+            random_sleep(1.5, 3.0)
+
+        comment_els = find_els(driver, SEL["comment_items"])
+        comments = []
+        for el in comment_els:
+            try:
+                text_el, _ = find_el(el, SEL["comment_text"])
+                text = text_el.text.strip() if text_el else ""
+                if not text:
+                    continue
+                like_el, _ = find_el(el, SEL["comment_like"])
+                author_el, _ = find_el(el, SEL["comment_author"])
+                like_raw = like_el.text.strip() if like_el else "0"
+                author = author_el.text.strip() if author_el else "匿名"
+                comments.append({
+                    "post_uid": post["uid"], "post_title": post["title"],
+                    "comment_text": text,
+                    "comment_like": parse_number(like_raw),
+                    "comment_like_raw": like_raw,
+                    "author": author,
+                })
+            except Exception:
+                continue
+
+        comments.sort(key=lambda x: x["comment_like"], reverse=True)
+        top = comments[:max_comments]
+        print(f"      评论：找到 {len(comment_els)} 条，取 Top {len(top)}")
+        return body_text, top
+
+    except Exception as e:
+        print(f"      详情页异常：{e}")
+        return "", []
+    finally:
+        try:
+            set_mobile_mode(driver, enable=False)
+            driver.get(original_url)
+            random_sleep(2, 4)
+        except Exception:
+            pass
 
 def scrape_all_details(driver, top10_posts):
     """对 Top10 笔记逐一抓正文+评论"""
@@ -937,7 +1022,7 @@ def scrape_all_details(driver, top10_posts):
 # =========================================================
 
 def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
-    """调用 Gemini 1.5 Flash API（免费版）"""
+    """改进的 Gemini API 调用，支持详细错误诊断"""
     url = GEMINI_API_URL.format(api_key=api_key)
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -945,15 +1030,47 @@ def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
     }
     try:
         resp = requests.post(url, json=payload, timeout=60)
-        resp.raise_for_status()
+        
+        # ✅ 详细错误处理
+        if resp.status_code == 404:
+            return ("⚠️ Gemini API 端点 404（Not Found）\n"
+                   "可能原因：\n"
+                   "  1. API Key 无效或已失效\n"
+                   "  2. 模型不可用（gemini-1.5-flash 可能已变更）\n\n"
+                   "解决方案：\n"
+                   "  • 重新申请 API Key：https://aistudio.google.com/app/apikey\n"
+                   "  • 确保是最新的免费 API（无需信用卡）\n"
+                   "  • 检查 API 安全设置中是否开启了此模型")
+        
+        if resp.status_code == 401:
+            return ("⚠️ Gemini API 认证失败（401 Unauthorized）\n"
+                   "原因：API Key 错误或已过期\n\n"
+                   "解决方案：\n"
+                   "  • 检查 API Key 是否正确复制（包括末尾的空格）\n"
+                   "  • 前往 https://aistudio.google.com/app/apikey 重新生成\n"
+                   "  • 重新运行程序并输入新的 Key")
+        
+        if resp.status_code == 429:
+            return ("⚠️ Gemini API 请求过于频繁（429 Too Many Requests）\n"
+                   "原因：已超过每日免费额度（1500次/天）\n\n"
+                   "解决方案：\n"
+                   "  • 请等待 24 小时后重试\n"
+                   "  • 如需更多额度，升级为付费计划")
+        
+        if resp.status_code == 400:
+            error_detail = resp.json().get("error", {}).get("message", "未知错误")
+            return f"⚠️ 请求参数错误（400）：{error_detail}"
+        
+        resp.raise_for_status()  # 其他错误则抛出异常
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
-    except requests.exceptions.HTTPError as e:
-        if resp.status_code == 429:
-            return "⚠️ Gemini API 今日免费额度已用完（1500次/天），请明天再试"
-        return f"⚠️ API 请求失败：{e}"
+        
+    except requests.exceptions.JSONDecodeError:
+        return f"⚠️ API 返回非法 JSON：{resp.text[:200]}"
+    except requests.exceptions.Timeout:
+        return "⚠️ 请求超时（60秒）→ 网络可能较慢或服务繁忙"
     except Exception as e:
-        return f"⚠️ 解析响应失败：{e}"
+        return f"⚠️ Gemini 请求异常：{type(e).__name__}: {str(e)[:100]}"
 
 
 def build_analysis_prompt(keyword: str, top10: list, all_comments: list) -> str:

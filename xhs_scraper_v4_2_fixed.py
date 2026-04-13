@@ -56,44 +56,42 @@ def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
     """改进的 Gemini 调用"""
     url = GEMINI_API_URL.format(api_key=api_key)
     
-    # 先验证 API Key 有效性
-    test_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
-    test_payload = {
-        "contents": [{"parts": [{"text": "test"}]}],
-        "generationConfig": {"maxOutputTokens": 10, "temperature": 0.4},
-    }
-    
     try:
-        # 测试连接
-        resp = requests.post(test_url, json=test_payload, timeout=10)
-        
-        if resp.status_code == 404:
-            print("⚠️ Gemini API 端点 404，可能的原因：")
-            print("  1. API Key 无效或已过期 - 重新申请：https://aistudio.google.com/app/apikey")
-            print("  2. 你的区域/账户不支持该模型 - 试试用 gemini-pro 替代")
-            print("  3. 模型名称拼写错误")
-            return "⚠️ Gemini API 配置错误（404），请检查 Key 是否有效"
-        
-        if resp.status_code == 401:
-            return "⚠️ Gemini API 认证失败，请检查 Key 是否正确"
-        
-        if resp.status_code == 429:
-            return "⚠️ Gemini API 今日额度已满（1500/天），请明天再试"
-        
-        # 实际请求
+        # 直接调用，无需预验证（减少一次 API 请求，节省配额）
         resp = requests.post(url, json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
         }, timeout=60)
         
-        resp.raise_for_status()
+        # 详细的错误处理
+        if resp.status_code == 404:
+            return ("⚠️ Gemini API 端点 404\n"
+                   "可能原因：\n"
+                   "  1. API Key 无效或已失效 → 重新申请：https://aistudio.google.com/app/apikey\n"
+                   "  2. 模型不可用（gemini-1.5-flash 可能已变更）→ 检查 API 文档\n"
+                   "  3. 地区限制 → 某些国家可能不支持")
+        
+        if resp.status_code == 401:
+            return "⚠️ Gemini API 认证失败（401）→ 请检查 API Key 是否正确"
+        
+        if resp.status_code == 429:
+            return "⚠️ Gemini API 配额已满（1500次/天）→ 请明天再试"
+        
+        if resp.status_code == 400:
+            error_detail = resp.json().get("error", {}).get("message", "未知错误")
+            return f"⚠️ 请求参数错误（400）：{error_detail}"
+        
+        resp.raise_for_status()  # 其他错误则抛出异常
+        
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
         
-    except requests.exceptions.JSONDecodeError:
+    except requests.exceptions.JSONDecodeError as e:
         return f"⚠️ API 返回非法 JSON：{resp.text[:200]}"
+    except requests.exceptions.Timeout:
+        return "⚠️ 请求超时（60秒）→ 网络可能较慢或服务繁忙"
     except Exception as e:
-        return f"⚠️ Gemini 请求失败：{e}"
+        return f"⚠️ Gemini 请求异常：{type(e).__name__}: {str(e)[:100]}"
 # ---- 移动端 UA：让小红书走手机渲染路径，绕过"扫码才能看"限制 ----
 MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "

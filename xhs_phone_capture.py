@@ -297,8 +297,7 @@ class XhsCaptureAddon:
                 _handle_comments(data, note_id)
             elif "/homefeed" in url:
                 _handle_search(data)
-            else:
-                print(f"[未匹配] {url[:120]}")
+            # 其他小红书 JSON 请求不做处理（避免静态资源产生大量日志）
 
         except Exception as exc:
             print(f"[异常] response() 处理失败: {exc}")

@@ -11,10 +11,13 @@ DeepSeek API Key 申请：
   https://platform.deepseek.com/api_keys
 """
 
-import time, random, sys, re, pickle, json, hashlib, subprocess, requests, html
+import time, random, sys, re, pickle, json, hashlib, subprocess, requests, html, os
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1," + os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
+os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -47,6 +50,7 @@ LOGIN_TIMEOUT     = 120
 TARGET_POSTS      = 100
 MAX_COMMENTS      = 10
 MAX_SCROLL_ROUNDS = 30
+ENABLE_MOBILE_FALLBACK = False
 
 # DeepSeek API（OpenAI-compatible Chat Completions）
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
@@ -131,16 +135,21 @@ SEL = {
         '//li[contains(@class,"comment")]',
     ],
     "comment_text": [
+        './/div[contains(@class,"content")]//span[contains(@class,"note-text")]',
+        './/div[contains(@class,"content")]',
         './/span[contains(@class,"content")]',
         './/p[contains(@class,"content")]',
         './/div[contains(@class,"comment-content")]',
     ],
     "comment_like": [
+        './/div[contains(@class,"like")]//span[contains(@class,"count")]',
         './/span[contains(@class,"like-count")]',
         './/span[contains(@class,"count")]',
         './/div[contains(@class,"like")]//span',
     ],
     "comment_author": [
+        './/a[contains(@class,"name")]',
+        './/div[contains(@class,"author")]//a',
         './/span[contains(@class,"author")]',
         './/a[contains(@class,"author")]',
         './/div[contains(@class,"user-info")]//span',
@@ -213,6 +222,14 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+def _driver_alive(driver) -> bool:
+    try:
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
 # =========================================================
 # 浏览器初始化
 # =========================================================
@@ -252,7 +269,22 @@ def _resolve_chromedriver_path(cfg: dict) -> str | None:
         print(f"  使用已保存的 ChromeDriver：{saved}")
         return saved
 
-    # 次选：webdriver-manager 本地缓存
+    # 次选：直接扫描 webdriver-manager 已有缓存，避免代理/网络异常时卡住。
+    cache_root = Path.home() / ".wdm" / "drivers" / "chromedriver"
+    try:
+        cached = [
+            p for p in cache_root.rglob("chromedriver")
+            if p.is_file() and "THIRD_PARTY" not in str(p)
+        ]
+        if cached:
+            cached.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            path = str(cached[0])
+            print(f"  使用本地缓存 ChromeDriver：{path}")
+            return path
+    except Exception:
+        pass
+
+    # 兜底：webdriver-manager 自动获取
     try:
         from webdriver_manager.chrome import ChromeDriverManager
         print("  正在获取本地 ChromeDriver（首次需联网下载，约数秒）...")
@@ -380,26 +412,31 @@ def set_mobile_mode(driver, enable: bool):
     enable=True：进入详情页前调用，让小红书走手机渲染路径（可看正文）
     enable=False：返回搜索列表页前调用，恢复 PC 模式（XPath 选择器正常工作）
     """
-    if enable:
-        driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-            "userAgent": MOBILE_UA,
-            "platform": "iPhone",
-        })
-        driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
-            "width": 390, "height": 844,
-            "deviceScaleFactor": 3,
-            "mobile": True,
-        })
-    else:
-        driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-            "userAgent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "platform": "MacIntel",
-        })
-        driver.execute_cdp_cmd("Emulation.clearDeviceMetricsOverride", {})
+    try:
+        if enable:
+            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                "userAgent": MOBILE_UA,
+                "platform": "iPhone",
+            })
+            driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+                "width": 390, "height": 844,
+                "deviceScaleFactor": 3,
+                "mobile": True,
+            })
+        else:
+            driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                "userAgent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "platform": "MacIntel",
+            })
+            driver.execute_cdp_cmd("Emulation.clearDeviceMetricsOverride", {})
+        return True
+    except Exception as e:
+        print(f"      浏览器模式切换失败，跳过：{e}")
+        return False
 
 
 
@@ -767,10 +804,24 @@ def _extract_post(el):
         raw_like    = like_el.text.strip()    if like_el    else ""
         raw_collect = collect_el.text.strip() if collect_el else ""
         raw_comment = comment_el.text.strip() if comment_el else ""
+        href = ""
         try:
-            href = el.find_element(By.XPATH, './/a[@href]').get_attribute("href") or ""
+            links = [
+                a.get_attribute("href") or ""
+                for a in el.find_elements(By.XPATH, './/a[@href]')
+            ]
+            note_links = [
+                h for h in links
+                if "/explore/" in h or "/search_result/" in h or "/discovery/item/" in h
+            ]
+            # 小红书现在很多详情页必须带 xsec_token 才能直接访问；
+            # 卡片里通常同时有短链接和带 token 的链接，优先保留后者。
+            href = next((h for h in note_links if "xsec_token=" in h), None)
+            href = href or (note_links[0] if note_links else (links[0] if links else ""))
         except NoSuchElementException:
             href = ""
+        if not href or not any(part in href for part in ["/explore/", "/search_result/", "/discovery/item/"]):
+            return None
         return {
             "uid": uid_of(title, href), "title": title, "link": href,
             "like": parse_number(raw_like),
@@ -949,10 +1000,16 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
         return "", []
 
     print(f"    详情页：{post['title'][:28]}...")
-    original_url = driver.current_url
+    try:
+        original_url = driver.current_url
+    except Exception:
+        print("      浏览器会话已断开，跳过该详情页")
+        return "", []
+
     try:
         # 先用 PC 登录态打开。你在网页上能看全文时，这条路径最稳定。
-        set_mobile_mode(driver, enable=False)
+        if not set_mobile_mode(driver, enable=False):
+            return "", []
         driver.get(link)
         random_sleep(3, 5)
 
@@ -960,9 +1017,10 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
 
         # 如果 PC 详情页没有输出正文，再尝试移动端 H5。当前环境里这个路径可能被风控，
         # 所以只作为兜底，避免一开始就破坏正常网页登录态。
-        if not body_text:
+        if not body_text and ENABLE_MOBILE_FALLBACK:
             try:
-                set_mobile_mode(driver, enable=True)
+                if not set_mobile_mode(driver, enable=True):
+                    raise RuntimeError("浏览器会话不可用")
                 driver.get(link)
                 random_sleep(3, 5)
                 body_text, source = _extract_note_body(driver)
@@ -975,11 +1033,15 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
             print(f"      正文抓取成功（{len(body_text)} 字，{source}）")
 
         # 滚动加载评论
-        for _ in range(3):
-            driver.execute_script("window.scrollBy(0, 600);")
-            random_sleep(1.5, 3.0)
-
-        comment_els = find_els(driver, SEL["comment_items"])
+        comment_els = []
+        if _driver_alive(driver):
+            try:
+                for _ in range(3):
+                    driver.execute_script("window.scrollBy(0, 600);")
+                    random_sleep(1.5, 3.0)
+                comment_els = find_els(driver, SEL["comment_items"])
+            except Exception as e:
+                print(f"      评论加载失败，跳过评论：{e}")
         comments = []
         for el in comment_els:
             try:
@@ -1012,9 +1074,10 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
     finally:
         try:
             # 返回搜索列表页前恢复 PC 模式，保证选择器正常
-            set_mobile_mode(driver, enable=False)
-            driver.get(original_url)
-            random_sleep(2, 4)
+            if _driver_alive(driver):
+                set_mobile_mode(driver, enable=False)
+                driver.get(original_url)
+                random_sleep(2, 4)
         except Exception:
             pass
 
@@ -1066,7 +1129,7 @@ def call_deepseek(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
         return f"⚠️ 解析响应失败：{e}"
 
 
-def build_analysis_prompt(keyword: str, top10: list, all_comments: list) -> str:
+def build_analysis_prompt(keyword: str, top10: list, all_comments: list, user_prompt: str = "") -> str:
     """
     构建发给 DeepSeek 的分析提示词。
     包含 Top10 标题+正文摘要+热评，让 AI 做深度学术分析。
@@ -1085,14 +1148,7 @@ def build_analysis_prompt(keyword: str, top10: list, all_comments: list) -> str:
             for c in post_cmts[:5]:
                 posts_text += f"    · {c['author']}（👍{c['comment_like_raw']}）：{c['comment_text'][:80]}\n"
 
-    prompt = f"""你是一位社会学/传播学研究助理，请对以下小红书数据进行学术分析。
-
-关键词：「{keyword}」
-数据来源：小红书平台 Top10 热门笔记（按综合热度排序）
-
-{posts_text}
-
-请从以下维度进行分析（每项约 150-200 字，使用正式学术语言）：
+    default_task = """请从以下维度进行分析（每项约 150-200 字，使用正式学术语言）：
 
 1. **内容主题归纳**
    归纳 Top10 笔记的核心议题和话题类型，识别高频词汇与主导叙事框架。
@@ -1107,19 +1163,31 @@ def build_analysis_prompt(keyword: str, top10: list, all_comments: list) -> str:
    从传播学视角总结该话题在小红书平台上的传播特点。
 
 5. **研究局限与建议**
-   指出本次数据采集的局限性，并对后续研究提出建议。
+   指出本次数据采集的局限性，并对后续研究提出建议。"""
+    task = user_prompt.strip() or default_task
 
-请以 Markdown 格式输出，语言简洁专业，适合直接引用于学术论文。"""
+    prompt = f"""你是一位严谨的社会学/传播学研究助理。请基于以下小红书爬取结果，完成用户指定的个性化报告任务。
+
+【用户报告需求】
+{task}
+
+关键词：「{keyword}」
+数据来源：小红书平台 Top10 热门笔记（按综合热度排序）
+
+{posts_text}
+
+请严格围绕【用户报告需求】生成报告；爬虫结果只作为数据依据，不要编造数据中没有的信息。
+请以 Markdown 格式输出，语言风格、结构和重点服从用户需求。"""
     return prompt
 
 
-def run_ai_analysis(api_key: str, keyword: str, top10_posts: list, all_comments: list) -> str:
+def run_ai_analysis(api_key: str, keyword: str, top10_posts: list, all_comments: list, user_prompt: str = "") -> str:
     """执行 DeepSeek 分析，返回分析报告文本"""
     if not api_key or api_key == "YOUR_DEEPSEEK_API_KEY":
         return "（未配置 DeepSeek API Key，跳过 AI 分析）"
 
     print("\nDeepSeek AI 分析中...")
-    prompt = build_analysis_prompt(keyword, top10_posts, all_comments)
+    prompt = build_analysis_prompt(keyword, top10_posts, all_comments, user_prompt)
     result = call_deepseek(api_key, prompt)
     print("  AI 分析完成")
     return result
@@ -1310,7 +1378,7 @@ def generate_html_report(df, top10, comments_df, keyword, ai_analysis=""):
 # 主流程
 # =========================================================
 
-def run(keyword, target=TARGET_POSTS, deepseek_key="", cfg=None):
+def run(keyword, target=TARGET_POSTS, deepseek_key="", ai_user_prompt="", cfg=None):
     if cfg is None:
         cfg = load_config()
     driver = init_driver(cfg=cfg)
@@ -1342,7 +1410,7 @@ def run(keyword, target=TARGET_POSTS, deepseek_key="", cfg=None):
         analyze(df, keyword)
 
         # 5. DeepSeek AI 分析
-        ai_result = run_ai_analysis(deepseek_key, keyword, top10_posts, all_comments)
+        ai_result = run_ai_analysis(deepseek_key, keyword, top10_posts, all_comments, ai_user_prompt)
         if ai_result and "未配置" not in ai_result:
             print("\n===== AI 分析摘要（前 500 字）=====")
             print(ai_result[:500] + "...\n（完整内容见 HTML 报告）")
@@ -1381,7 +1449,10 @@ def run(keyword, target=TARGET_POSTS, deepseek_key="", cfg=None):
         print("\n已手动中断")
     finally:
         random_sleep(1, 2)
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -1418,6 +1489,14 @@ if __name__ == "__main__":
         save_config(cfg)
         print("  Key 已保存，下次自动使用")
 
+    ai_user_prompt = ""
+    if deepseek_key:
+        print("\n--- 个性化 AI 报告需求 ---")
+        print("  请输入你希望 AI 如何分析/写作的 prompt。")
+        print("  例如：请从养老服务需求角度写一份政策建议报告，重点分析照护痛点和服务缺口。")
+        print("  留空则使用默认学术分析模板；输入完按回车提交。")
+        ai_user_prompt = input("  Prompt：").strip()
+
     # ChromeDriver 路径配置
     saved_driver = cfg.get("chromedriver_path", "")
     print("\n--- ChromeDriver 配置 ---")
@@ -1438,4 +1517,4 @@ if __name__ == "__main__":
         elif new_path:
             print(f"  警告：路径不存在，将尝试自动查找")
 
-    run(kw, target, deepseek_key, cfg=cfg)
+    run(kw, target, deepseek_key, ai_user_prompt, cfg=cfg)

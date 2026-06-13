@@ -1,17 +1,17 @@
 """
-小红书学术数据采集工具  v4.1
+小红书学术数据采集工具  v4.2
 ================================
 新增：
-  - 移动端 UA 伪装 + 详情页完整内容抓取（解决扫码限制）
-  - Gemini AI 免费 API 深度分析（每日 1500 次免费）
+  - 优先使用 PC 已登录页面抓取详情全文，移动端 H5 仅作为兜底
+  - DeepSeek API 深度分析
   - 分析结果写入 HTML 报告
 
 依赖：pip install selenium webdriver-manager undetected-chromedriver pandas requests
-Gemini API Key 申请（免费，无需信用卡）：
-  https://aistudio.google.com/app/apikey
+DeepSeek API Key 申请：
+  https://platform.deepseek.com/api_keys
 """
 
-import time, random, sys, re, pickle, json, hashlib, subprocess, requests
+import time, random, sys, re, pickle, json, hashlib, subprocess, requests, html
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -37,20 +37,20 @@ except ImportError:
 # 全局配置
 # =========================================================
 XHS_HOME       = "https://www.xiaohongshu.com"
+XHS_EXPLORE_URL = "https://www.xiaohongshu.com/explore"
 XHS_SEARCH_URL = "https://www.xiaohongshu.com/search_result?keyword={kw}&type=51&sort=hot"
-COOKIE_FILE    = "xhs_cookies.pkl"
-CONFIG_FILE    = "xhs_config.json"
+SCRIPT_DIR     = Path(__file__).resolve().parent
+COOKIE_FILE    = SCRIPT_DIR / "xhs_cookies.pkl"
+CONFIG_FILE    = SCRIPT_DIR / "xhs_config.json"
 
 LOGIN_TIMEOUT     = 120
 TARGET_POSTS      = 100
 MAX_COMMENTS      = 10
 MAX_SCROLL_ROUNDS = 30
 
-# Gemini 免费 API（每日 1500 次，无需信用卡）
-GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-1.5-flash:generateContent?key={api_key}"
-)
+# DeepSeek API（OpenAI-compatible Chat Completions）
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 # ---- 移动端 UA：让小红书走手机渲染路径，绕过"扫码才能看"限制 ----
 MOBILE_UA = (
@@ -113,7 +113,12 @@ SEL = {
     ],
     # ---- 详情页：笔记正文 ----
     "note_body": [
+        '//*[@id="detail-desc"]//*[contains(@class,"note-text")]',
+        '//*[@id="detail-desc"]',
+        '//div[contains(@class,"note-content")]//*[contains(@class,"note-text")]',
         '//div[contains(@class,"note-content")]//span[contains(@class,"note-text")]',
+        '//div[contains(@class,"note-content")]',
+        '//div[contains(@class,"note-detail")]//div[contains(@class,"desc")]',
         '//div[contains(@id,"detail-desc")]',
         '//div[contains(@class,"desc")]//span',
         '//div[contains(@class,"content")]//p',
@@ -198,6 +203,14 @@ def load_config():
 def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _clean_text(text: str) -> str:
+    text = html.unescape(text or "")
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+    text = text.replace("\\n", "\n").replace("\\/", "/")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 # =========================================================
@@ -825,21 +838,111 @@ def scroll_and_collect(driver, target=TARGET_POSTS):
 
 # =========================================================
 # 详情页：抓取正文 + 评论
-# 关键改进：移动端 UA + CDP 设备模拟，让内容直接渲染
+# 关键改进：优先使用 PC 已登录详情页，移动端 H5 仅作为兜底
 # =========================================================
+
+def _click_expand_buttons(driver):
+    """小红书详情页正文有时默认折叠，先尝试点开。"""
+    candidates = [
+        '//*[self::button or self::span or self::div][normalize-space()="展开"]',
+        '//*[self::button or self::span or self::div][contains(normalize-space(),"展开更多")]',
+        '//*[self::button or self::span or self::div][contains(normalize-space(),"更多")]',
+    ]
+    for xp in candidates:
+        try:
+            for el in driver.find_elements(By.XPATH, xp)[:3]:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    random_sleep(0.4, 0.9)
+        except Exception:
+            continue
+
+
+def _extract_note_body(driver) -> tuple[str, str]:
+    """
+    从当前详情页提取正文，返回 (正文, 来源)。
+    先读页面可见 DOM；如果前端把数据塞进脚本状态里，再从源码兜底提取。
+    """
+    _click_expand_buttons(driver)
+    candidates = []
+
+    # 1. Selenium XPath：兼容当前配置中的多套 DOM。
+    for xp in SEL["note_body"]:
+        try:
+            parts = driver.find_elements(By.XPATH, xp)
+            text = " ".join(p.text.strip() for p in parts if p.text.strip())
+            text = _clean_text(text)
+            if text:
+                candidates.append((text, f"XPath: {xp[:48]}"))
+        except Exception:
+            continue
+
+    # 2. JS 直接读 innerText：有些节点 Selenium .text 会为空。
+    try:
+        js_texts = driver.execute_script("""
+            const selectors = [
+              '#detail-desc .note-text',
+              '#detail-desc',
+              '.note-content .note-text',
+              '.note-content',
+              '.note-detail .desc',
+              '[class*="note-text"]',
+              '[class*="desc"]'
+            ];
+            const out = [];
+            for (const sel of selectors) {
+              for (const el of document.querySelectorAll(sel)) {
+                const text = (el.innerText || el.textContent || '').trim();
+                if (text) out.push([text, sel]);
+              }
+            }
+            return out;
+        """)
+        for text, sel in js_texts or []:
+            text = _clean_text(text)
+            if text:
+                candidates.append((text, f"CSS: {sel}"))
+    except Exception:
+        pass
+
+    # 3. 源码兜底：新版页面常把 desc/content 放在 hydration JSON 里。
+    try:
+        src = driver.page_source
+        patterns = [
+            r'"desc"\s*:\s*"((?:\\.|[^"\\]){20,})"',
+            r'"description"\s*:\s*"((?:\\.|[^"\\]){20,})"',
+            r'"content"\s*:\s*"((?:\\.|[^"\\]){20,})"',
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']{20,})["\']',
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{20,})["\']',
+        ]
+        for pat in patterns:
+            for match in re.findall(pat, src):
+                text = _clean_text(match)
+                if text and "小红书" not in text[:12]:
+                    candidates.append((text, "page state/meta"))
+    except Exception:
+        pass
+
+    bad_words = (
+        "登录", "扫码", "打开小红书", "下载小红书", "验证码",
+        "当前内容仅支持", "APP 内查看", "APP内查看",
+    )
+    filtered = [
+        (text, source) for text, source in candidates
+        if len(text) >= 8 and not any(w in text[:80] for w in bad_words)
+    ]
+    if not filtered:
+        return "", ""
+
+    # 同一正文可能被多个选择器命中，取最长的有效文本。
+    best_text, best_source = max(filtered, key=lambda item: len(item[0]))
+    return best_text, best_source
 
 def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
     """
     进入笔记详情页，抓取：
-    - 完整正文（小红书 PC 端需扫码才能看，移动端模拟后直接可读）
+    - 完整正文（优先使用当前已登录 PC 页面）
     - 点赞最高的前 N 条评论
-
-    为什么移动端 UA 能绕过扫码限制：
-      小红书服务端通过 User-Agent 区分 PC/手机浏览器。
-      PC 端访问详情页会触发"下载 App"拦截弹窗并阻止内容渲染；
-      手机浏览器 UA 则走移动端 H5 路径，内容直接输出到页面 HTML 中。
-      配合 CDP Emulation.setDeviceMetricsOverride 同步模拟屏幕参数，
-      确保 JS 端 viewport 检测也认为是手机，双重保证内容加载。
     """
     link = post.get("link", "")
     if not link:
@@ -848,28 +951,28 @@ def scrape_detail(driver, post, max_comments=MAX_COMMENTS):
     print(f"    详情页：{post['title'][:28]}...")
     original_url = driver.current_url
     try:
-        # 进详情页前切换为移动端模式，让小红书渲染完整正文
-        set_mobile_mode(driver, enable=True)
+        # 先用 PC 登录态打开。你在网页上能看全文时，这条路径最稳定。
+        set_mobile_mode(driver, enable=False)
         driver.get(link)
         random_sleep(3, 5)
 
-        # 等待正文区域出现（最多 10 秒）
-        body_text = ""
-        for xp in SEL["note_body"]:
+        body_text, source = _extract_note_body(driver)
+
+        # 如果 PC 详情页没有输出正文，再尝试移动端 H5。当前环境里这个路径可能被风控，
+        # 所以只作为兜底，避免一开始就破坏正常网页登录态。
+        if not body_text:
             try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.XPATH, xp))
-                )
-                parts = driver.find_elements(By.XPATH, xp)
-                body_text = " ".join(p.text.strip() for p in parts if p.text.strip())
-                if body_text:
-                    print(f"      正文抓取成功（{len(body_text)} 字）")
-                    break
-            except TimeoutException:
-                continue
+                set_mobile_mode(driver, enable=True)
+                driver.get(link)
+                random_sleep(3, 5)
+                body_text, source = _extract_note_body(driver)
+            except Exception as e:
+                print(f"      移动端兜底失败：{e}")
 
         if not body_text:
             print("      正文未找到（可能仍需登录或 DOM 结构已更新）")
+        else:
+            print(f"      正文抓取成功（{len(body_text)} 字，{source}）")
 
         # 滚动加载评论
         for _ in range(3):
@@ -931,26 +1034,33 @@ def scrape_all_details(driver, top10_posts):
 
 
 # =========================================================
-# Gemini AI 分析
-# 免费额度：1500 次/天，无需信用卡
-# 申请 Key：https://aistudio.google.com/app/apikey
+# DeepSeek AI 分析
+# 申请 Key：https://platform.deepseek.com/api_keys
 # =========================================================
 
-def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
-    """调用 Gemini 1.5 Flash API（免费版）"""
-    url = GEMINI_API_URL.format(api_key=api_key)
+def call_deepseek(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
+    """调用 DeepSeek Chat API"""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是一位严谨的社会学/传播学研究助理。"},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.4,
     }
     try:
-        resp = requests.post(url, json=payload, timeout=60)
+        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=90)
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return data["choices"][0]["message"]["content"]
     except requests.exceptions.HTTPError as e:
         if resp.status_code == 429:
-            return "⚠️ Gemini API 今日免费额度已用完（1500次/天），请明天再试"
+            return "⚠️ DeepSeek API 请求过于频繁或额度不足，请稍后再试"
         return f"⚠️ API 请求失败：{e}"
     except Exception as e:
         return f"⚠️ 解析响应失败：{e}"
@@ -958,7 +1068,7 @@ def call_gemini(api_key: str, prompt: str, max_tokens: int = 2048) -> str:
 
 def build_analysis_prompt(keyword: str, top10: list, all_comments: list) -> str:
     """
-    构建发给 Gemini 的分析提示词。
+    构建发给 DeepSeek 的分析提示词。
     包含 Top10 标题+正文摘要+热评，让 AI 做深度学术分析。
     """
     posts_text = ""
@@ -1004,13 +1114,13 @@ def build_analysis_prompt(keyword: str, top10: list, all_comments: list) -> str:
 
 
 def run_ai_analysis(api_key: str, keyword: str, top10_posts: list, all_comments: list) -> str:
-    """执行 Gemini 分析，返回分析报告文本"""
-    if not api_key or api_key == "YOUR_GEMINI_API_KEY":
-        return "（未配置 Gemini API Key，跳过 AI 分析）"
+    """执行 DeepSeek 分析，返回分析报告文本"""
+    if not api_key or api_key == "YOUR_DEEPSEEK_API_KEY":
+        return "（未配置 DeepSeek API Key，跳过 AI 分析）"
 
-    print("\nGemini AI 分析中...")
+    print("\nDeepSeek AI 分析中...")
     prompt = build_analysis_prompt(keyword, top10_posts, all_comments)
-    result = call_gemini(api_key, prompt)
+    result = call_deepseek(api_key, prompt)
     print("  AI 分析完成")
     return result
 
@@ -1128,7 +1238,7 @@ def generate_html_report(df, top10, comments_df, keyword, ai_analysis=""):
     ai_section = ""
     if ai_analysis and "未配置" not in ai_analysis:
         ai_section = f"""
-        <h2 style="font-size:16px;margin:28px 0 12px;color:#444">🤖 Gemini AI 学术分析</h2>
+        <h2 style="font-size:16px;margin:28px 0 12px;color:#444">🤖 DeepSeek AI 学术分析</h2>
         <div style="background:#fff;border-radius:12px;padding:20px 24px;
                     box-shadow:0 2px 10px rgba(0,0,0,.06);line-height:1.8;font-size:14px;color:#333">
           {md_to_html(ai_analysis)}
@@ -1186,7 +1296,7 @@ def generate_html_report(df, top10, comments_df, keyword, ai_analysis=""):
 
 {ai_section}
 
-<div class="footer">本报告由小红书学术数据采集工具 v4.1 生成 · 仅供学术研究使用</div>
+<div class="footer">本报告由小红书学术数据采集工具 v4.2 生成 · 仅供学术研究使用</div>
 </body></html>"""
 
     fname = f"report_{keyword}_{datetime.now().strftime('%Y%m%d_%H%M')}.html"
@@ -1200,7 +1310,7 @@ def generate_html_report(df, top10, comments_df, keyword, ai_analysis=""):
 # 主流程
 # =========================================================
 
-def run(keyword, target=TARGET_POSTS, gemini_key="", cfg=None):
+def run(keyword, target=TARGET_POSTS, deepseek_key="", cfg=None):
     if cfg is None:
         cfg = load_config()
     driver = init_driver(cfg=cfg)
@@ -1221,7 +1331,7 @@ def run(keyword, target=TARGET_POSTS, gemini_key="", cfg=None):
         top10_df    = df.sort_values("score", ascending=False).head(10).reset_index(drop=True)
         top10_posts = top10_df.to_dict("records")
 
-        # 3. 进入详情页抓正文 + 评论（移动端模拟，绕过扫码限制）
+        # 3. 进入详情页抓正文 + 评论（优先使用 PC 已登录页面）
         all_comments = scrape_all_details(driver, top10_posts)
         # 把正文写回 top10_df
         for p in top10_posts:
@@ -1231,8 +1341,8 @@ def run(keyword, target=TARGET_POSTS, gemini_key="", cfg=None):
         # 4. 控制台 Top10 打印
         analyze(df, keyword)
 
-        # 5. Gemini AI 分析
-        ai_result = run_ai_analysis(gemini_key, keyword, top10_posts, all_comments)
+        # 5. DeepSeek AI 分析
+        ai_result = run_ai_analysis(deepseek_key, keyword, top10_posts, all_comments)
         if ai_result and "未配置" not in ai_result:
             print("\n===== AI 分析摘要（前 500 字）=====")
             print(ai_result[:500] + "...\n（完整内容见 HTML 报告）")
@@ -1280,7 +1390,7 @@ def run(keyword, target=TARGET_POSTS, gemini_key="", cfg=None):
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  小红书学术数据采集工具  v4.1")
+    print("  小红书学术数据采集工具  v4.2")
     print("  仅供学术研究，请遵守平台使用规范")
     print("=" * 55)
 
@@ -1294,18 +1404,17 @@ if __name__ == "__main__":
     t_in   = input(f"目标笔记数（默认 {TARGET_POSTS}，建议 100-300）: ").strip()
     target = int(t_in) if t_in.isdigit() and int(t_in) > 0 else TARGET_POSTS
 
-    print("\n--- Gemini AI 分析配置 ---")
-    print("  免费申请 Key（无需信用卡）：https://aistudio.google.com/app/apikey")
-    print("  每日免费额度：1500 次")
-    saved_key = cfg.get("gemini_key", "")
+    print("\n--- DeepSeek AI 分析配置 ---")
+    print("  申请 Key：https://platform.deepseek.com/api_keys")
+    saved_key = cfg.get("deepseek_key", "")
     if saved_key:
         use_saved = input(f"  检测到已保存的 Key（...{saved_key[-6:]}），直接使用？(Y/n): ").strip().lower()
-        gemini_key = saved_key if use_saved != "n" else input("  请输入新的 Gemini API Key（留空跳过）: ").strip()
+        deepseek_key = saved_key if use_saved != "n" else input("  请输入新的 DeepSeek API Key（留空跳过）: ").strip()
     else:
-        gemini_key = input("  请输入 Gemini API Key（留空跳过 AI 分析）: ").strip()
+        deepseek_key = input("  请输入 DeepSeek API Key（留空跳过 AI 分析）: ").strip()
 
-    if gemini_key and gemini_key != saved_key:
-        cfg["gemini_key"] = gemini_key
+    if deepseek_key and deepseek_key != saved_key:
+        cfg["deepseek_key"] = deepseek_key
         save_config(cfg)
         print("  Key 已保存，下次自动使用")
 
@@ -1329,4 +1438,4 @@ if __name__ == "__main__":
         elif new_path:
             print(f"  警告：路径不存在，将尝试自动查找")
 
-    run(kw, target, gemini_key, cfg=cfg)
+    run(kw, target, deepseek_key, cfg=cfg)

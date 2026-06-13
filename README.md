@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/28907260/README.md)[Uploading R# 小红书学术数据采集工具
+Uploading R# 小红书学术数据采集工具
 
 > 基于 Selenium + DeepSeek AI 的小红书内容采集与分析工具，仅供学术研究使用。
 
